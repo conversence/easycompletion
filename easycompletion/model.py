@@ -1,13 +1,18 @@
 import os
 import time
-import openai
 import re
 import json
 import ast
 import asyncio
+from typing import Optional, Literal, Union, Tuple, Any
 
+import openai
+from openai import OpenAI, AsyncOpenAI
+from openai.types import CompletionUsage
+from openai.types.chat import ChatCompletion
 from dotenv import load_dotenv
 import tiktoken
+from pydantic import BaseModel
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,6 +35,31 @@ from .logger import log
 from .prompt import count_tokens
 
 openai.api_base = EASYCOMPLETION_API_ENDPOINT
+
+clients = {}
+async_clients = {}
+
+def get_client(api_key=EASYCOMPLETION_API_KEY):
+    global clients
+    if api_key not in clients:
+        clients[api_key] = OpenAI(api_key=api_key)
+    return clients[api_key]
+
+def get_async_client(api_key=EASYCOMPLETION_API_KEY):
+    global async_clients
+    if api_key not in async_clients:
+        async_clients[api_key] = AsyncOpenAI(api_key=api_key)
+    return async_clients[api_key]
+
+
+class SimpleResult(BaseModel):
+    error: Optional[str] = None
+    text: Optional[str] = None
+    usage: Optional[CompletionUsage] = None
+    finish_reason: Optional[Literal["stop", "length", "tool_calls", "content_filter", "function_call"]]
+    function_name: Optional[str] = None
+    arguments: Any = None
+
 
 def parse_arguments(arguments, debug=DEBUG):
     """
@@ -86,34 +116,30 @@ def validate_functions(response, functions, function_call, debug=DEBUG):
     """
     print('response')
     print(response)
-    response_function_call = response["choices"][0]["message"].get(
-        "function_call", None
-    )
-    if response_function_call is None:
-        log(f"No function call in response\n{response}", type="error", log=debug)
+    response_tool_calls = response.choices[0].message.tool_calls
+    if not response_tool_calls:
+        log(f"No tool call in response\n{response}", type="error", log=debug)
         return False
 
     # If function_call is not "auto" and the name does not match with the response, return False
-    if (
-        function_call != "auto"
-        and response_function_call["name"] != function_call["name"]
-    ):
-        log("Function call does not match", type="error", log=debug)
-        return False
+    if function_call == "auto":
+        tool_call = response_tool_calls[0]
+    else:
+        for tool_call in response_tool_calls:
+            if tool_call.function.name == function_call['name']:
+                break
+        else:
+            log("Function call does not match", type="error", log=debug)
+            return False
 
-    # If function_call is "auto", extract the name from the response
-    function_call_name = (
-        function_call["name"]
-        if function_call != "auto"
-        else response_function_call["name"]
-    )
+    function_call_name = tool_call.function.name
 
     # Parse the arguments from the response
-    arguments = parse_arguments(response_function_call["arguments"])
+    arguments = parse_arguments(tool_call.function.arguments)
 
     # Get the function that matches the function name from the list of functions
     function = next(
-        (item for item in functions if item["name"] == function_call_name), None
+        (item for item in functions if item['name'] == function_call_name), None
     )
 
     # If no matching function is found, return False
@@ -132,14 +158,14 @@ def validate_functions(response, functions, function_call, debug=DEBUG):
         log(
             "Arguments are None"
             + f"\nExpected arguments:\n{str(function['parameters']['properties'].keys())}"
-            + f"\n\nResponse function call:\n{str(response_function_call)}",
+            + f"\n\nResponse function call:\n{str(response_tool_calls)}",
             type="error",
             log=debug,
         )
         #
         return False
 
-    required_properties = function["parameters"].get("required", [])
+    required_properties = function["parameters"]["required"]
 
     # Check that arguments.keys() contains all of the required properties
     if not all(
@@ -157,7 +183,7 @@ def validate_functions(response, functions, function_call, debug=DEBUG):
         return False
 
     log("Function call is valid", type="success", log=debug)
-    return True
+    return tool_call
 
 
 def is_long_model(model_name):
@@ -174,9 +200,8 @@ def build_model_info(model_names, factor=0.75):
 def sanity_check(prompt, model=None, model_info=None, chunk_length=DEFAULT_CHUNK_LENGTH, api_key=EASYCOMPLETION_API_KEY, debug=DEBUG):
     # Validate the API key
     if not api_key.strip():
-        return [], {"error": "Invalid OpenAI API key"}
+        return [], "Invalid OpenAI API key"
 
-    openai.api_key = api_key
     # Construct a model_info from legacy parameters
     if chunk_length not in (None, DEFAULT_CHUNK_LENGTH):
         log("Warning: deprecated use of chuck_length. Please use model_info.",
@@ -217,12 +242,7 @@ def sanity_check(prompt, model=None, model_info=None, chunk_length=DEFAULT_CHUNK
     # If text is too long even for long text model, return None
     if not models:
         print("Error: Message too long")
-        return models, {
-            "text": None,
-            "usage": None,
-            "finish_reason": None,
-            "error": "Message too long",
-        }
+        return models, "Message too long"
 
     if models[0] != model_info[0][0]:
         log("Warning: Message is long. Using larger models (to hide this message, set SUPPRESS_WARNINGS=1)",
@@ -240,19 +260,19 @@ def sanity_check(prompt, model=None, model_info=None, chunk_length=DEFAULT_CHUNK
     return models, None
 
 def do_chat_completion(
-        messages, models, temperature=0.8, functions=None, function_call=None, model_failure_retries=5, debug=DEBUG):
+        client, messages, models, temperature=0.8, functions=None, function_call=None, model_failure_retries=5, debug=DEBUG) -> Tuple[Optional[ChatCompletion], Optional[SimpleResult]]:
     # Try to make a request for a specified number of times
-    response = None
+    response: Optional[ChatCompletion] = None
     model = models[0]
     for i in range(model_failure_retries):
         try:
             if functions is not None:
-                response = openai.ChatCompletion.create(
+                response = client.chat.completions.create(
                     model=model, messages=messages, temperature=temperature,
-                    functions=functions, function_call=function_call,
+                    tools=[dict(type="function", function=function) for function in functions]
                 )
             else:
-                response = openai.ChatCompletion.create(
+                response = client.chat.completions.create(
                     model=model, messages=messages, temperature=temperature
                 )
             log('response', log=debug)
@@ -266,29 +286,60 @@ def do_chat_completion(
     # If response is not valid, print an error message and return None
     if (
         not response
-        or not response.get("choices")
-        or not response["choices"][0]
+        or not response.choices[0]
     ):
-        return None, {
-            "text": None,
-            "usage": None,
-            "finish_reason": None,
-            "error": "Error: Could not get a successful response from OpenAI API",
-        }
+        return None, SimpleResult(error="Error: Could not get a successful response from OpenAI API")
 
     # Check if failed for length reasons.
-    choices = response.get("choices", [])
-    if choices and all(choice.get("finish_reason", None) == 'length' for choice in choices):
+    choices = response.choices
+    if choices and all(choice.finish_reason == 'length' for choice in choices):
         models.pop(0)  # Side effect: Do not ever retry that model on that prompt
         if models:
             log("Failed because of length, trying next model", log=debug)
-            return do_chat_completion(messages, models, temperature, functions, function_call, model_failure_retries, debug)
-        return None, {
-            "text": None,
-            "usage": None,
-            "finish_reason": 'length',
-            "error": "Error: The prompt elicits too-long responses",
-        }
+            return do_chat_completion(client, messages, models, temperature=temperature, functions=functions, function_call=function_call, model_failure_retries=model_failure_retries, debug=debug)
+        return None, SimpleResult(finish_reason= 'length', error= "Error: The prompt elicits too-long responses", usage=response.usage)
+
+    return response, None
+
+async def do_chat_completion_async(
+        client, messages, models, temperature=0.8, functions=None, function_call=None, model_failure_retries=5, debug=DEBUG) -> Union[ChatCompletion, SimpleResult]:
+    # Try to make a request for a specified number of times
+    response: Optional[ChatCompletion] = None
+    model = models[0]
+    for i in range(model_failure_retries):
+        try:
+            if functions is not None:
+                response = await client.chat.completions.create(
+                    model=model, messages=messages, temperature=temperature,
+                    tools=[dict(type="function", function=function) for function in functions]
+                )
+            else:
+                response = await client.chat.completions.create(
+                    model=model, messages=messages, temperature=temperature
+                )
+            log('response', log=debug)
+            log(response, log=debug)
+            break
+        except Exception as e:
+            log(f"OpenAI Error: {e}", type="error", log=debug)
+
+    # TODO: Are there other reasons to try fallback models?
+
+    # If response is not valid, print an error message and return None
+    if (
+        not response
+        or not response.choices[0]
+    ):
+        return None, SimpleResult(error="Error: Could not get a successful response from OpenAI API")
+
+    # Check if failed for length reasons.
+    choices = response.choices
+    if choices and all(choice.finish_reason == 'length' for choice in choices):
+        models.pop(0)  # Side effect: Do not ever retry that model on that prompt
+        if models:
+            log("Failed because of length, trying next model", log=debug)
+            return await do_chat_completion_async(client, messages, models, temperature=temperature, functions=functions, function_call=function_call, model_failure_retries=model_failure_retries, debug=debug)
+        return None, SimpleResult(finish_reason= 'length', error= "Error: The prompt elicits too-long responses", usage=response.usage)
 
     return response, None
 
@@ -301,7 +352,7 @@ def chat_completion(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Function for sending chat messages and returning a chat response.
 
@@ -319,32 +370,27 @@ def chat_completion(
     Example:
         >>> text_completion("Hello, how are you?", model_failure_retries=3, model='gpt-3.5-turbo', chunk_length=1024, api_key='your_openai_api_key')
     """
-    openai.api_key = api_key
-
     # Use the default model if no model is specified
 
     models, error = sanity_check(messages, model_info=model_info, model=model, chunk_length=chunk_length, api_key=api_key, debug=debug)
     if error:
         return error
 
+    client = get_client(api_key)
+
     # Try to make a request for a specified number of times
     response, error = do_chat_completion(
-        messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
+        client, messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
 
     if error:
         return error
 
     # Extract content from the response
-    text = response["choices"][0]["message"]["content"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
-
-    return {
-        "text": text,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    choice = response.choices[0]
+    return SimpleResult(
+        text=choice.message.content,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)
 
 
 async def chat_completion_async(
@@ -356,7 +402,7 @@ async def chat_completion_async(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Function for sending chat messages and returning a chat response.
 
@@ -381,24 +427,21 @@ async def chat_completion_async(
     if error:
         return error
 
+    client = get_async_client(api_key)
+
     # Try to make a request for a specified number of times
-    response, error = await asyncio.to_thread(lambda: do_chat_completion(
-        messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug))
+    response, error = await do_chat_completion_async(
+        client, messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
 
     if error:
         return error
 
     # Extract content from the response
-    text = response["choices"][0]["message"]["content"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
-
-    return {
-        "text": text,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    choice = response.choices[0]
+    return SimpleResult(
+        text=choice.message.content,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)
 
 
 def text_completion(
@@ -410,7 +453,7 @@ def text_completion(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Function for sending text and returning a text completion response.
 
@@ -437,23 +480,20 @@ def text_completion(
     # Prepare messages for the API call
     messages = [{"role": "user", "content": text}]
 
+    client = get_client(api_key)
+
     # Try to make a request for a specified number of times
     response, error = do_chat_completion(
-        messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
+        client, messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
     if error:
         return error
 
     # Extract content from the response
-    text = response["choices"][0]["message"]["content"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
-
-    return {
-        "text": text,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    choice = response.choices[0]
+    return SimpleResult(
+        text=choice.message.content,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)
 
 async def text_completion_async(
     text,
@@ -464,7 +504,7 @@ async def text_completion_async(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Function for sending text and returning a text completion response.
 
@@ -491,24 +531,21 @@ async def text_completion_async(
     # Prepare messages for the API call
     messages = [{"role": "user", "content": text}]
 
+    client = get_async_client(api_key)
+
     # Try to make a request for a specified number of times
-    response, error = await asyncio.to_thread(lambda: do_chat_completion(
-        messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug))
+    response, error = await do_chat_completion_async(
+        client, messages, models, temperature=temperature, model_failure_retries=model_failure_retries, debug=debug)
 
     if error:
         return error
 
     # Extract content from the response
-    text = response["choices"][0]["message"]["content"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
-
-    return {
-        "text": text,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    choice = response.choices[0]
+    return SimpleResult(
+        text=choice.message.content,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)
 
 
 def function_completion(
@@ -525,7 +562,7 @@ def function_completion(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Send text and a list of functions to the model and return optional text and a function call.
     The function call is validated against the functions array.
@@ -632,19 +669,23 @@ def function_completion(
 
     # Retry function call and model calls according to the specified retry counts
     response = None
+    client = get_client(api_key)
+
     for _ in range(function_failure_retries):
         # Try to make a request for a specified number of times
         response, error = do_chat_completion(
-            all_messages, models, temperature=temperature, function_call=function_call,
+            client, all_messages, models, temperature=temperature, function_call=function_call,
             functions=functions, model_failure_retries=model_failure_retries, debug=debug)
         if error:
             time.sleep(1)
             continue
         print('***** response')
         print(response)
-        if validate_functions(response, functions, function_call):
+        if tool_call := validate_functions(response, functions, function_call):
             break
-        if response.get("choices", [{}])[0].get("finish_reason", None) == 'length':
+        else:
+            response = None
+        if response.choices[0].finish_reason == 'length':
             return {
                 "text": None,
                 "usage": response.usage,
@@ -658,33 +699,17 @@ def function_completion(
         return error
 
     # Extracting the content and function call response from API response
-    response_data = response["choices"][0]["message"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
+    choice = response.choices[0]
 
-    text = response_data["content"]
-    function_call_response = response_data.get("function_call", None)
-
-    # If no function call in response, return an error
-    if function_call_response is None:
-        log(f"No function call in response\n{response}", type="error", log=debug)
-        return {"error": "No function call in response"}
-    function_name = function_call_response["name"]
-    arguments = parse_arguments(function_call_response["arguments"])
-    log(
-        f"Response\n\nFunction Name: {function_name}\n\nArguments:\n{arguments}\n\nText:\n{text}\n\nFinish Reason: {finish_reason}\n\nUsage:\n{usage}",
-        type="response",
-        log=debug,
-    )
     # Return the final result with the text response, function name, arguments and no error
-    return {
-        "text": text,
-        "function_name": function_name,
-        "arguments": arguments,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    choice = response.choices[0]
+    return SimpleResult(
+        text=choice.message.content,
+        function_name= tool_call.function.name,
+        arguments= tool_call.function.arguments,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)
+
 
 async def function_completion_async(
     text=None,
@@ -700,7 +725,7 @@ async def function_completion_async(
     api_key=EASYCOMPLETION_API_KEY,
     debug=DEBUG,
     temperature=0.0,
-):
+) -> SimpleResult:
     """
     Send text and a list of functions to the model and return optional text and a function call.
     The function call is validated against the functions array.
@@ -807,19 +832,21 @@ async def function_completion_async(
 
     # Retry function call and model calls according to the specified retry counts
     response = None
+    client = get_async_client(api_key)
+
     for _ in range(function_failure_retries):
         # Try to make a request for a specified number of times
-        response, error = await asyncio.to_thread(lambda: do_chat_completion(
-            all_messages, models, temperature=temperature, function_call=function_call,
-            functions=functions, model_failure_retries=model_failure_retries, debug=debug))
+        response, error = await do_chat_completion_async(
+            client, all_messages, models, temperature=temperature, function_call=function_call,
+            functions=functions, model_failure_retries=model_failure_retries, debug=debug)
         if error:
             time.sleep(1)
             continue
         print('***** response')
         print(response)
-        if validate_functions(response, functions, function_call):
+        if tool_call := validate_functions(response, functions, function_call):
             break
-        if response.get("choices", [{}])[0].get("finish_reason", None) == 'length':
+        if response.choices[0].finish_reason == 'length':
             return {
                 "text": None,
                 "usage": response.usage,
@@ -833,30 +860,12 @@ async def function_completion_async(
         return error
 
     # Extracting the content and function call response from API response
-    response_data = response["choices"][0]["message"]
-    finish_reason = response["choices"][0]["finish_reason"]
-    usage = response["usage"]
+    choice = response.choices[0]
 
-    text = response_data["content"]
-    function_call_response = response_data.get("function_call", None)
-
-    # If no function call in response, return an error
-    if function_call_response is None:
-        log(f"No function call in response\n{response}", type="error", log=debug)
-        return {"error": "No function call in response"}
-    function_name = function_call_response["name"]
-    arguments = parse_arguments(function_call_response["arguments"])
-    log(
-        f"Response\n\nFunction Name: {function_name}\n\nArguments:\n{arguments}\n\nText:\n{text}\n\nFinish Reason: {finish_reason}\n\nUsage:\n{usage}",
-        type="response",
-        log=debug,
-    )
     # Return the final result with the text response, function name, arguments and no error
-    return {
-        "text": text,
-        "function_name": function_name,
-        "arguments": arguments,
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "error": None,
-    }
+    return SimpleResult(
+        text=choice.message.content,
+        function_name= tool_call.function.name,
+        arguments= tool_call.function.arguments,
+        usage=response.usage,
+        finish_reason=choice.finish_reason)

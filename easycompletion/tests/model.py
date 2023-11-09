@@ -18,8 +18,8 @@ def test_parse_arguments():
 async def test_text_completion_async():
     response = await text_completion_async("Hello, how are you?")
     assert response is not None, "Test text_completion_async failed"
-    assert response["text"] is not None, "Test text_completion_async failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
+    assert response.text is not None, "Test text_completion_async failed"
+    prompt_tokens = response.usage.prompt_tokens
     assert prompt_tokens == 13, "Prompt tokens was not the expected count"
 
 
@@ -41,11 +41,11 @@ async def test_function_completion_async():
         },
     }
     response = await function_completion_async(
-        text=test_text, functions=test_function, function_call="write_song"
+        text=test_text, functions=[test_function], function_call="write_song"
     )
     assert response is not None, "Test function_completion_async failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
-    assert prompt_tokens == 64, "Prompt tokens was not the expected count"
+    prompt_tokens = response.usage.prompt_tokens
+    assert prompt_tokens == 58, "Prompt tokens was not the expected count"
 
     response = await function_completion_async(
         text=test_text,
@@ -55,8 +55,8 @@ async def test_function_completion_async():
         function_call="write_song",
     )
     assert response is not None, "Test function_completion_async failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
-    assert prompt_tokens == 76, "Prompt tokens was not the expected count"
+    prompt_tokens = response.usage.prompt_tokens
+    assert prompt_tokens == 70, "Prompt tokens was not the expected count"
 
 def test_function_completion():
     test_text = "Write a song about AI"
@@ -75,11 +75,11 @@ def test_function_completion():
         },
     }
     response = function_completion(
-        text=test_text, functions=test_function, function_call="write_song"
+        text=test_text, functions=[test_function], function_call="write_song"
     )
     assert response is not None, "Test function_completion failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
-    assert prompt_tokens == 64, "Prompt tokens was not expected count"
+    prompt_tokens = response.usage.prompt_tokens
+    assert prompt_tokens == 58, "Prompt tokens was not expected count"
 
     response = function_completion(
         text=test_text,
@@ -89,8 +89,8 @@ def test_function_completion():
         function_call="write_song",
     )
     assert response is not None, "Test function_completion failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
-    assert prompt_tokens == 76, "Prompt tokens was not expected count"
+    prompt_tokens = response.usage.prompt_tokens
+    assert prompt_tokens == 70, "Prompt tokens was not expected count"
 
 
 def test_chat_completion():
@@ -102,16 +102,16 @@ def test_chat_completion():
     )
 
     assert response is not None, "Test text_completion failed"
-    assert response["text"] is not None, "Test text_completion failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
+    assert response.text is not None, "Test text_completion failed"
+    prompt_tokens = response.usage.prompt_tokens
     assert prompt_tokens == 27, "Prompt tokens was not expected count"
 
 
 def test_text_completion():
     response = text_completion("Hello, how are you?")
     assert response is not None, "Test text_completion failed"
-    assert response["text"] is not None, "Test text_completion failed"
-    prompt_tokens = response["usage"]["prompt_tokens"]
+    assert response.text is not None, "Test text_completion failed"
+    prompt_tokens = response.usage.prompt_tokens
     assert prompt_tokens == 13, "Prompt tokens was not expected count"
 
 
