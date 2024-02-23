@@ -695,7 +695,7 @@ def function_completion(
         time.sleep(1)
 
     # Check if we have a valid response from the model
-    if not response:
+    if not response or not tool_call:
         return error
 
     # Extracting the content and function call response from API response
@@ -856,7 +856,7 @@ async def function_completion_async(
         time.sleep(1)
 
     # Check if we have a valid response from the model
-    if not response:
+    if not response or not tool_call:
         return error
 
     # Extracting the content and function call response from API response
